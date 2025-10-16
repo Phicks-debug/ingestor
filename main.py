@@ -9,6 +9,8 @@ import semchunk
 import multiprocessing
 import uuid
 import hashlib
+import asyncio
+import aiobedrock
 
 from logsim import CustomLogger
 from fastapi import BackgroundTasks, FastAPI, File, UploadFile
@@ -314,7 +316,6 @@ def sync_document_from_s3():
                 # Generate embeddings
                 log.info(msg=f"Generating embeddings for {filename}")
                 image_embeddings = embedding_images(images)
-                log.debug(f"Embeddings: {image_embeddings}")
                 log.info(msg=f"Generated embeddings for {filename}")
 
                 # Upsert vectors in Qdrant with S3 keys
@@ -458,76 +459,115 @@ def embedding_texts(chunks: list[str]) -> list:
     return orjson.loads(response["body"].read())
 
 
-def embedding_images(images: list[str], batch_size: int = 5) -> dict:
+async def __process_image_batch_async(
+    client: aiobedrock.Client,
+    batch_images: list[str],
+    batch_num: int,
+    total_batches: int,
+    batch_start: int,
+    batch_end: int,
+) -> list:
     """
-    Invoke Bedrock embedding model to get images embeddings.
-    Processes images in batches to avoid input length limits.
-
-    Args:
-        images: List of base64-encoded images
-        batch_size: Number of images to process per API call (default: 5)
-
-    Returns:
-        Dictionary with combined embeddings from all batches
+    Process a single batch of images asynchronously.
     """
-    client = __create_aws_client("bedrock-runtime")
+    log.info(
+        f"Processing batch {batch_num}/{total_batches} "
+        f"(images {batch_start + 1}-{batch_end})"
+    )
 
-    # Split images into batches
-    total_images = len(images)
-    all_embeddings = []
+    body = {
+        "images": batch_images,
+        "input_type": "search_document",
+        "embedding_types": [EMBEDDING_OUTPUT_TYPE],
+        "output_dimension": EMBEDDING_OUTPUT_DIMENSION,
+        "max_tokens": 128000,
+        "truncate": "NONE",
+    }
 
-    log.info(f"Processing {total_images} images in batches of {batch_size}")
-
-    for batch_start in range(0, total_images, batch_size):
-        batch_end = min(batch_start + batch_size, total_images)
-        batch_images = images[batch_start:batch_end]
-        batch_num = (batch_start // batch_size) + 1
-        total_batches = (total_images + batch_size - 1) // batch_size
-
-        log.info(
-            f"Processing batch {batch_num}/{total_batches} "
-            f"(images {batch_start + 1}-{batch_end})"
+    try:
+        response = await client.invoke_model(
+            body=orjson.dumps(body),
+            modelId="global.cohere.embed-v4:0",
+            contentType="application/json",
+            accept="application/json",
+            trace="ENABLED",
         )
 
-        body = {
-            "images": batch_images,
-            "input_type": "search_document",
-            "embedding_types": [EMBEDDING_OUTPUT_TYPE],
-            "output_dimension": EMBEDDING_OUTPUT_DIMENSION,
-            "max_tokens": 128000,
-            "truncate": "NONE",
-        }
+        batch_result = orjson.loads(response)
+        batch_embeddings = batch_result["embeddings"][EMBEDDING_OUTPUT_TYPE]
 
-        try:
-            response = client.invoke_model(
-                modelId="global.cohere.embed-v4:0",
-                contentType="application/json",
-                accept="application/json",
-                body=orjson.dumps(body),
-                trace="ENABLED",
+        log.info(
+            f"Successfully processed batch {batch_num}/{total_batches} "
+            f"({len(batch_embeddings)} embeddings)"
+        )
+
+        return batch_embeddings
+
+    except Exception as e:
+        log.exception(
+            msg="Failed to process batch"
+            f" {batch_num}/{total_batches}: {str(e)}"  # noqa: E501
+        )
+        raise
+
+
+async def __embedding_images_async(
+    images: list[str],
+    batch_size: int = 10,
+) -> dict:
+    """
+    Async function to invoke Bedrock embedding model for images.
+    Processes all batches concurrently using asyncio.
+    """
+    total_images = len(images)
+    total_batches = (total_images + batch_size - 1) // batch_size
+
+    log.info(
+        f"Processing {total_images} images in "
+        f"{total_batches} batches of {batch_size}"
+    )
+
+    # Create aiobedrock client with assume_role_arn
+    async with aiobedrock.Client(
+        region_name=AWS_REGION,
+        assume_role_arn=__get_assume_role_arn("bedrock"),
+    ) as client:
+        # Create tasks for all batches
+        tasks = []
+        for batch_start in range(0, total_images, batch_size):
+            batch_end = min(batch_start + batch_size, total_images)
+            batch_images = images[batch_start:batch_end]
+            batch_num = (batch_start // batch_size) + 1
+
+            task = __process_image_batch_async(
+                client=client,
+                batch_images=batch_images,
+                batch_num=batch_num,
+                total_batches=total_batches,
+                batch_start=batch_start,
+                batch_end=batch_end,
             )
+            tasks.append(task)
 
-            batch_result = orjson.loads(response["body"].read())
-            batch_embeddings = batch_result["embeddings"][EMBEDDING_OUTPUT_TYPE]
+        # Execute all batches concurrently
+        all_batch_results = await asyncio.gather(*tasks)
+
+        # Flatten all embeddings into a single list
+        all_embeddings = []
+        for batch_embeddings in all_batch_results:
             all_embeddings.extend(batch_embeddings)
 
-            log.info(
-                f"Successfully processed batch {batch_num}/{total_batches} "
-                f"({len(batch_embeddings)} embeddings)"
-            )
-
-        except Exception as e:
-            log.exception(
-                f"Failed to process batch {batch_num}/{total_batches}: {str(e)}"
-            )
-            raise
-
     # Return result in the same format as the original function
-    return {
-        "embeddings": {
-            EMBEDDING_OUTPUT_TYPE: all_embeddings
-        }
-    }
+    return {"embeddings": {EMBEDDING_OUTPUT_TYPE: all_embeddings}}
+
+
+def embedding_images(images: list[str], batch_size: int = 10) -> dict:
+    """
+    Invoke Bedrock embedding model to get images embeddings.
+    Processes images in batches concurrently
+    using asyncio to avoid input length limits.
+    """
+    return asyncio.run(__embedding_images_async(images, batch_size))
 
 
 def upsert_database(
