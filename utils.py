@@ -4,6 +4,9 @@ import jinja2
 
 
 def load_tokenizer():
+    """
+    Load the tokenizer from cache.
+    """
     # Set tiktoken cache directory to local repo
     TIKTOKEN_CACHE_DIR = os.path.join(
         os.path.dirname(__file__),
@@ -17,6 +20,17 @@ def load_tokenizer():
         tiktoken.get_encoding("o200k_base")
     except Exception as e:
         print(f"⚠ Warning: Could not load tokenizer from cache: {e}")
+
+
+def load_hashes():
+    """
+    Load the document hashes from cache.
+    """
+    DOCUMENT_HASH_FILE = os.path.join(
+        os.path.dirname(__file__),
+        ".document_hashes.json",
+    )
+    os.environ["DOCUMENT_HASH_FILE"] = DOCUMENT_HASH_FILE
 
 
 def render_template(template_name: str, context: dict = None) -> str:
