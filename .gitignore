@@ -15,7 +15,6 @@ wheels/
 
 # Project environment files
 .env
-docker-compose.yaml
 
 # Document hash tracking
 .document_hashes.json

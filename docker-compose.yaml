@@ -1,0 +1,35 @@
+services:
+  qdrant:
+    image: qdrant/qdrant
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY}"
+      QDRANT__SERVICE__WEB_CONSOLE_ENABLED: "true"
+
+  ingestor:
+    build: .
+    container_name: ingestor
+    ports:
+      - "8000:8000"
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_BEDROCK_ASSUME_ROLE_ARN=${AWS_BEDROCK_ASSUME_ROLE_ARN}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - S3_DOCUMENTS_BUCKET=${S3_DOCUMENTS_BUCKET}
+      - S3_IMAGES_BUCKET=${S3_IMAGES_BUCKET}
+      - PARSING_MODEL_ID=${PARSING_MODEL_ID}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=document
+      - CHUNK_SIZE=1024
+      - EMBEDDING_OUTPUT_TYPE=float
+      - EMBEDDING_OUTPUT_DIMENSION=1024
+
+volumes:
+  qdrant_storage:

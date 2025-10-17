@@ -1,35 +1,36 @@
+import asyncio
+import base64
+import hashlib
+import json
+import multiprocessing
 import os
 import time
-import fitz
-import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Optional
+
+import aiobedrock
 import boto3
-import base64
+import fitz
 import orjson
 import semchunk
-import multiprocessing
-import uuid
-import hashlib
-import asyncio
-import aiobedrock
-
-from enum import Enum
-from dataclasses import dataclass, field
-from typing import Optional
-from datetime import datetime
-from logsim import CustomLogger
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
-from utils import load_tokenizer, load_hashes, render_template
+from logsim import CustomLogger
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
     PointStruct,
     VectorParams,
-    Filter,
-    FieldCondition,
-    MatchValue,
 )
+
+from utils import load_hashes, load_tokenizer, render_template
 
 load_dotenv()
 load_hashes()
@@ -49,10 +50,10 @@ PARSING_MODEL_ID = os.getenv("PARSING_MODEL_ID")
 DOCUMENT_HASH_FILE = os.getenv("DOCUMENT_HASH_FILE")
 
 CHUNK_TYPE = os.getenv("CHUNK_TYPE")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE"))  # type: ignore
 
 EMBEDDING_OUTPUT_TYPE = os.getenv("EMBEDDING_OUTPUT_TYPE")
-EMBEDDING_OUTPUT_DIMENSION = int(os.getenv("EMBEDDING_OUTPUT_DIMENSION"))
+EMBEDDING_OUTPUT_DIMENSION = int(os.getenv("EMBEDDING_OUTPUT_DIMENSION"))  # type: ignore # noqa: E501
 
 _ASSUME_ROLE_MAP = {
     "s3": lambda: os.getenv("AWS_S3_ASSUME_ROLE_ARN"),
@@ -444,13 +445,13 @@ def chunking(text: str) -> list[str]:
     Uses o200k_base tokenizer (200k vocab, 128k context).
     """
     # Use gpt-4o which uses o200k_base encoding (200k vocab size)
-    chunker = semchunk.chunkerify("o200k_base", CHUNK_SIZE)
+    chunker = semchunk.chunkerify("o200k_base", CHUNK_SIZE)  # type: ignore
     # Define number of processes for parallel chunking
     # Use max-1 cores to leave one core free for system operations
     cpu_count = multiprocessing.cpu_count()
     process_num = max(1, cpu_count - 1)
     log.debug(f"Num processes for chunking: {process_num}")
-    return chunker(text, processes=process_num)
+    return chunker(text, processes=process_num)  # type: ignore
 
 
 def embedding_texts(chunks: list[str]) -> list:
@@ -489,121 +490,42 @@ def upsert_database(
     chunks: list[str],
     embedding_results: dict,
     metadata: dict,
-    s3_image_keys: list[str] = None,
+    s3_image_keys: Optional[list[str]] = None,
     is_image: bool = False,
 ):
     """
     Upsert vectors into Qdrant vector database.
     Raises ConnectionError if unable to connect to the database.
     """
-    # Create client
-    try:
-        client = QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY,
-            https=False,
-        )
-    except Exception as e:
-        error_msg = f"Failed to create Qdrant client: {str(e)}"
-        log.error(error_msg)
-        raise ConnectionError(error_msg) from e
+    # Create client and ensure collection exists
+    client = __create_qdrant_client()
+    __ensure_collection_exists(client)
 
-    # Ensure collection exists
-    try:
-        client.get_collection(collection_name=QDRANT_COLLECTION)
-        log.info(f"Collection '{QDRANT_COLLECTION}' already exists")
-    except ConnectionError:
-        # Re-raise connection errors
-        raise
-    except Exception as e:
-        # Check if this is a connection error
-        if __is_connection_error(e):
-            error_msg = (
-                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
-                "Please ensure the vector database is running and accessible."
-            )
-            log.error(error_msg)
-            raise ConnectionError(error_msg) from e
-
-        # Create collection if it doesn't exist
-        try:
-            log.info(f"Creating collection '{QDRANT_COLLECTION}'")
-            client.create_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=VectorParams(
-                    size=EMBEDDING_OUTPUT_DIMENSION,
-                    distance=Distance.COSINE,
-                ),
-            )
-        except Exception as create_error:
-            if __is_connection_error(create_error):
-                error_msg = (
-                    f"Cannot connect to Qdrant database at {QDRANT_URL}. "
-                    "Please ensure the vector database is running."
-                )
-                log.error(error_msg)
-                raise ConnectionError(error_msg) from create_error
-            raise
-
+    # Extract embeddings from results
     embeddings = embedding_results["embeddings"][EMBEDDING_OUTPUT_TYPE]
 
     # Prepare points for upsert
-    points = []
-    for idx, (chunk, vector) in enumerate(zip(chunks, embeddings)):
-        # Generate a unique ID based on filename and chunk index
-        point_id = hash(f"{metadata['filename']}_{idx}")
-
-        # Create payload with metadata
-        payload = {
-            **metadata,
-            "chunk_index": idx,
-            "content_type": "image" if is_image else "text",
-        }
-
-        # For images, store S3 key instead of base64 data
-        if is_image and s3_image_keys:
-            payload["image_s3_key"] = s3_image_keys[idx]
-        else:
-            # For text, store the actual content
-            payload["chunk_content"] = chunk
-
-        # Create point
-        point = PointStruct(
-            id=abs(point_id),  # Qdrant requires positive integer IDs
+    points = [
+        __create_point_struct(
+            idx=idx,
+            chunk=chunk,
             vector=vector,
-            payload=payload,
+            metadata=metadata,
+            is_image=is_image,
+            s3_image_keys=s3_image_keys,  # type: ignore
         )
-        points.append(point)
+        for idx, (chunk, vector) in enumerate(zip(chunks, embeddings))
+    ]
 
     # Upsert points to Qdrant
-    log.info(f"Upserting {len(points)} points")
-    try:
-        client.upsert(
-            collection_name=QDRANT_COLLECTION,
-            points=points,
-        )
-        log.info(
-            msg=f"Successfully upserted {len(points)} "
-            f"vectors for {metadata['filename']}"
-        )
-    except Exception as e:
-        if __is_connection_error(e):
-            error_msg = (
-                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
-                "Please ensure the vector database is running and accessible."
-            )
-            log.error(error_msg)
-            raise ConnectionError(error_msg) from e
-        raise
+    __upsert_points_to_qdrant(client, points, metadata)
 
 
 def __validate_parsing_response(response: str) -> str:
     """
     Validate and clean up parsing response.
     """
-    if not response.startswith("<markdown>") or not response.endswith(
-        "</markdown>"
-    ):  # noqa: E501
+    if not response.startswith("<markdown>") or not response.endswith("</markdown>"):  # noqa: E501
         raise ValueError("Parsed text has malformed markdown tags")
     if response.startswith("<markdown>"):
         response = response[10:]
@@ -646,7 +568,7 @@ def __create_aws_session_with_assumed_role(
     )
 
 
-def __create_aws_client(service_name: str) -> boto3.client:
+def __create_aws_client(service_name: str) -> Any:
     """
     Create an AWS client, optionally assuming a role if configured.
     """
@@ -833,14 +755,18 @@ def __load_document_hashes() -> dict:
     Load document hashes from the tracking file.
     Returns a dict mapping s3_key -> hash.
     """
-    if os.path.exists(DOCUMENT_HASH_FILE):
-        try:
-            with open(DOCUMENT_HASH_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            log.warning(f"Failed to load document hashes: {e}")
-            return {}
-    return {}
+    if DOCUMENT_HASH_FILE:
+        if os.path.exists(DOCUMENT_HASH_FILE):
+            try:
+                with open(DOCUMENT_HASH_FILE, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                log.warning(f"Failed to load document hashes: {e}")
+                return {}
+        return {}
+    else:
+        log.warning("DOCUMENT_HASH_FILE not set, skipping hash tracking")
+        return {}
 
 
 def __save_document_hashes(hashes: dict):
@@ -848,8 +774,11 @@ def __save_document_hashes(hashes: dict):
     Save document hashes to the tracking file.
     """
     try:
-        with open(DOCUMENT_HASH_FILE, "w") as f:
-            json.dump(hashes, f, indent=2)
+        if DOCUMENT_HASH_FILE:
+            with open(DOCUMENT_HASH_FILE, "w") as f:
+                json.dump(hashes, f, indent=2)
+        else:
+            log.warning("DOCUMENT_HASH_FILE not set, skipping hash tracking")
     except Exception as e:
         log.exception(f"Failed to save document hashes: {e}")
 
@@ -874,18 +803,21 @@ def __delete_document_from_qdrant(s3_key: str):
         )
 
         # Delete all points with matching s3_key
-        client.delete(
-            collection_name=QDRANT_COLLECTION,
-            points_selector=Filter(
-                must=[
-                    FieldCondition(
-                        key="s3_key",
-                        match=MatchValue(value=s3_key),
-                    )
-                ]
-            ),
-        )
-        log.info(f"Deleted vectors for document: {s3_key}")
+        if QDRANT_COLLECTION:
+            client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="s3_key",
+                            match=MatchValue(value=s3_key),
+                        )
+                    ]
+                ),
+            )
+            log.info(f"Deleted vectors for document: {s3_key}")
+        else:
+            log.warning("QDRANT_COLLECTION not set. Skipping deletion.")
     except Exception as e:
         if __is_connection_error(e):
             error_msg = (
@@ -960,6 +892,111 @@ def __is_connection_error(exception: Exception) -> bool:
     )
 
 
+def __check_document_unchanged(
+    task: DocumentTask,
+    stored_hashes: dict,
+) -> bool:
+    """
+    Check if document is unchanged and should be skipped.
+    Returns True if document is unchanged.
+    """
+    if task.s3_key in stored_hashes and stored_hashes[task.s3_key] == task.content_hash:  # noqa: E501
+        log.info(f"Skipping unchanged document: {task.filename}")
+        task.status = DocumentStatus.SKIPPED
+        task.error_message = None
+        return True
+    return False
+
+
+def __handle_document_change_status(
+    task: DocumentTask,
+    stored_hashes: dict,
+) -> bool:
+    """
+    Handle document change status (new or modified).
+    Returns True if document changed, False if new.
+    """
+    document_changed = task.s3_key in stored_hashes
+    if document_changed:
+        log.info(f"Document modified, reprocessing: {task.filename}")
+        __delete_document_from_qdrant(task.s3_key)
+    else:
+        log.info(f"New document detected: {task.filename}")
+    return document_changed
+
+
+def __get_or_convert_images(
+    task: DocumentTask,
+    content: bytes,
+    document_changed: bool,
+) -> tuple[list[str], list[str]]:
+    """
+    Get cached images or convert PDF to images.
+    Returns: (images, s3_keys)
+    """
+    # Only use cached images if document hasn't changed
+    if not document_changed:
+        c_exists, c_s3_keys = __check_cached_images_in_s3(task.filename)
+        if c_exists:
+            log.info(f"Using cached images from S3 for {task.filename}")
+            try:
+                images = __download_cached_images_from_s3(c_s3_keys)
+                return images, c_s3_keys
+            except Exception as e:
+                log.warning(
+                    msg=f"Failed to download cached images: {e}. "
+                    "Will convert PDF instead."
+                )
+
+    # Convert PDF to images if cache not available or download failed
+    log.info(f"Converting PDF to images for {task.filename}")
+    images, s3_keys, image_bytes_list = __convert_pdf_to_image(
+        file_content=content,
+        filename=task.filename,
+    )
+    log.info(f"Converted {len(images)} pages to images")
+
+    # Upload images to S3
+    log.info(f"Uploading {len(image_bytes_list)} images to S3")
+    __upload_images_to_s3(image_bytes_list, s3_keys, task.filename)
+    log.info("S3 upload completed")
+
+    return images, s3_keys
+
+
+def __handle_processing_exception(task: DocumentTask, e: Exception) -> bool:
+    """
+    Handle exceptions during document processing.
+    Returns False if throttled (needs retry),
+    raises exception for other errors.
+    """
+    if __is_timeout_error(e):
+        # Timeout error - mark as failed immediately without retry
+        task.status = DocumentStatus.FAILED
+        error_summary = str(e).split("\n")[0][:150]
+        task.error_message = error_summary
+        log.error(
+            msg=f"FAILED: {task.filename} - Model timeout error."
+            " Task marked as failed.\n"
+        )
+        raise
+    elif __is_throttle_error(e):
+        # Throttle error - mark for retry
+        task.status = DocumentStatus.THROTTLED
+        error_summary = str(e).split("\n")[0][:150]
+        task.error_message = error_summary
+        log.warning(
+            f"THROTTLED: {task.filename} - "
+            "Rate limit exceeded. Will retry after cooldown period.\n"
+        )
+        return False
+    else:
+        # Other error - re-raise
+        task.status = DocumentStatus.FAILED
+        task.error_message = str(e)
+        raise
+
+
 def __process_single_document(
     task: DocumentTask,
     s3_client,
@@ -981,58 +1018,19 @@ def __process_single_document(
         )
         content = file_obj["Body"].read()
 
-        # Check if document has changed
-        if (
-            task.s3_key in stored_hashes
-            and stored_hashes[task.s3_key] == task.content_hash
-        ):
-            log.info(f"Skipping unchanged document: {task.filename}")
-            task.status = DocumentStatus.SKIPPED
-            task.error_message = None
+        # Check if document is unchanged and should be skipped
+        if __check_document_unchanged(task, stored_hashes):
             return True
 
-        # Document is new or modified
-        document_changed = task.s3_key in stored_hashes
-        if document_changed:
-            log.info(f"Document modified, reprocessing: {task.filename}")
-            __delete_document_from_qdrant(task.s3_key)
-        else:
-            log.info(f"New document detected: {task.filename}")
+        # Handle document change status (new or modified)
+        document_changed = __handle_document_change_status(task, stored_hashes)
 
-        # Check if we can reuse cached images from S3
-        images = None
-        s3_keys = None
-        use_cached_images = False
-
-        # Only use cached images if document hasn't changed
-        if not document_changed:
-            c_exists, c_s3_keys = __check_cached_images_in_s3(task.filename)
-            if c_exists:
-                log.info(f"Using cached images from S3 for {task.filename}")
-                try:
-                    images = __download_cached_images_from_s3(c_s3_keys)
-                    s3_keys = c_s3_keys
-                    use_cached_images = True
-                except Exception as e:
-                    log.warning(
-                        f"Failed to download cached images: {e}. "
-                        "Will convert PDF instead."
-                    )
-                    use_cached_images = False
-
-        # Convert PDF to images if cache not available or download failed
-        if not use_cached_images:
-            log.info(f"Converting PDF to images for {task.filename}")
-            images, s3_keys, image_bytes_list = __convert_pdf_to_image(
-                file_content=content,
-                filename=task.filename,
-            )
-            log.info(f"Converted {len(images)} pages to images")
-
-            # Upload images to S3
-            log.info(f"Uploading {len(image_bytes_list)} images to S3")
-            __upload_images_to_s3(image_bytes_list, s3_keys, task.filename)
-            log.info("S3 upload completed")
+        # Get cached images or convert PDF to images
+        images, s3_keys = __get_or_convert_images(
+            task=task,
+            content=content,
+            document_changed=document_changed,
+        )
 
         # Generate embeddings - this is where throttling might occur
         task.status = DocumentStatus.EMBEDDING
@@ -1062,36 +1060,11 @@ def __process_single_document(
         task.status = DocumentStatus.FAILED
         task.error_message = str(e)
         log.error(
-            f"FAILED: {task.filename} - "
-            f"Database connection error: {str(e)}\n"  # noqa: E501
+            msg=f"FAILED: {task.filename} - Database connection error: {{{{str(e)}}}}\n"  # noqa: E501
         )
         raise
     except Exception as e:
-        if __is_timeout_error(e):
-            # Timeout error - mark as failed immediately without retry
-            task.status = DocumentStatus.FAILED
-            error_summary = str(e).split("\n")[0][:150]
-            task.error_message = error_summary
-            log.error(
-                f"FAILED: {task.filename} - "
-                "Model timeout error. Task marked as failed.\n"
-            )
-            raise
-        elif __is_throttle_error(e):
-            # Throttle error - mark for retry
-            task.status = DocumentStatus.THROTTLED
-            error_summary = str(e).split("\n")[0][:150]
-            task.error_message = error_summary
-            log.warning(
-                f"THROTTLED: {task.filename} - "
-                "Rate limit exceeded. Will retry after cooldown period.\n"
-            )
-            return False
-        else:
-            # Other error - re-raise
-            task.status = DocumentStatus.FAILED
-            task.error_message = str(e)
-            raise
+        return __handle_processing_exception(task, e)
 
 
 def __handle_empty_s3_bucket(stored_hashes: dict) -> None:
@@ -1167,7 +1140,7 @@ def __prepare_document_tasks(
 def __process_documents_with_retry(
     tasks: list[DocumentTask],
     s3_client,
-    stored_hashes: dict,
+    hashes: dict,
     task_status: SyncTaskStatus,
 ) -> dict:
     """
@@ -1199,9 +1172,13 @@ def __process_documents_with_retry(
             log.info(f"RETRY ROUND {retry_round}/{MAX_RETRIES}")
             log.info("=" * 60)
             log.info(
-                f"Waiting {RETRY_DELAY_SECONDS} seconds "
+                msg=f"Waiting {RETRY_DELAY_SECONDS} seconds "
                 "to refresh throttle limits..."
             )
+
+            # Update task status
+            task_status.current_operation = "Waiting for retry delay"
+
             time.sleep(RETRY_DELAY_SECONDS)
 
         log.info(f"<< Processing {len(pending_tasks)} documents...\n")
@@ -1218,11 +1195,7 @@ def __process_documents_with_retry(
             task_status.current_operation = f"Processing {task.filename}"
 
             try:
-                success = __process_single_document(
-                    task,
-                    s3_client,
-                    stored_hashes,
-                )
+                success = __process_single_document(task, s3_client, hashes)
 
                 if success:
                     # Document processed successfully or skipped
@@ -1300,7 +1273,7 @@ def __print_processing_summary(
 
 def __handle_deleted_documents(
     stored_hashes: dict,
-    current_s3_keys: any,
+    current_s3_keys: Any,
 ) -> None:
     """
     Detect and delete documents that were removed from S3.
@@ -1320,6 +1293,145 @@ def __handle_deleted_documents(
             )
             # Exist vì đéo có database thì làm ăn con cặc gì nữa
             raise
+
+
+def __create_qdrant_client() -> QdrantClient:
+    """
+    Create and return a Qdrant client.
+    Raises ConnectionError if unable to create the client.
+    """
+    try:
+        return QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+            https=False,
+        )
+    except Exception as e:
+        error_msg = f"Failed to create Qdrant client: {str(e)}"
+        log.error(error_msg)
+        raise ConnectionError(error_msg) from e
+
+
+def __ensure_collection_exists(client: QdrantClient) -> None:
+    """
+    Ensure the Qdrant collection exists, creating it if necessary.
+    Raises ConnectionError if unable to connect to the database.
+    """
+    try:
+        if QDRANT_COLLECTION:
+            client.get_collection(collection_name=QDRANT_COLLECTION)
+            log.info(f"Collection '{QDRANT_COLLECTION}' already exists")
+            return
+        else:
+            log.error("QDRANT_COLLECTION was not set, exist")
+            return
+    except ConnectionError:
+        raise
+    except Exception as e:
+        if __is_connection_error(e):
+            error_msg = (
+                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                "Please ensure the vector database is running and accessible."
+            )
+            log.error(error_msg)
+            raise ConnectionError(error_msg) from e
+
+        # Collection doesn't exist, create it
+        __create_collection(client)
+
+
+def __create_collection(client: QdrantClient) -> None:
+    """
+    Create a new Qdrant collection.
+    Raises ConnectionError if unable to connect to the database.
+    """
+    try:
+        if QDRANT_COLLECTION:
+            log.info(f"Creating collection '{QDRANT_COLLECTION}'")
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(
+                    size=EMBEDDING_OUTPUT_DIMENSION,
+                    distance=Distance.COSINE,
+                ),
+            )
+        else:
+            log.error("QDRANT_COLLECTION was not set, exist")
+            raise ValueError("QDRANT_COLLECTION was not set")
+    except Exception as create_error:
+        if __is_connection_error(create_error):
+            error_msg = (
+                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                "Please ensure the vector database is running."
+            )
+            log.error(error_msg)
+            raise ConnectionError(error_msg) from create_error
+        raise
+
+
+def __create_point_struct(
+    idx: int,
+    chunk: str,
+    vector: list,
+    metadata: dict,
+    is_image: bool,
+    s3_image_keys: Optional[list[str]] = None,
+) -> PointStruct:
+    """
+    Create a single PointStruct for upserting to Qdrant.
+    """
+    point_id = hash(f"{metadata['filename']}_{idx}")
+
+    payload = {
+        **metadata,
+        "chunk_index": idx,
+        "content_type": "image" if is_image else "text",
+    }
+
+    if is_image and s3_image_keys:
+        payload["image_s3_key"] = s3_image_keys[idx]
+    else:
+        payload["chunk_content"] = chunk
+
+    return PointStruct(
+        id=abs(point_id),
+        vector=vector,
+        payload=payload,
+    )
+
+
+def __upsert_points_to_qdrant(
+    client: QdrantClient,
+    points: list[PointStruct],
+    metadata: dict,
+) -> None:
+    """
+    Upsert points to Qdrant with error handling.
+    Raises ConnectionError if unable to connect to the database.
+    """
+    log.info(f"Upserting {len(points)} points")
+    try:
+        if QDRANT_COLLECTION:
+            client.upsert(
+                collection_name=QDRANT_COLLECTION,
+                points=points,
+            )
+            log.info(
+                msg=f"Successfully upserted {len(points)} "
+                f"vectors for {metadata['filename']}"
+            )
+        else:
+            log.error("QDRANT_COLLECTION is not set")
+            raise ValueError("QDRANT_COLLECTION is not set")
+    except Exception as e:
+        if __is_connection_error(e):
+            error_msg = (
+                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                "Please ensure the vector database is running and accessible."
+            )
+            log.error(error_msg)
+            raise ConnectionError(error_msg) from e
+        raise
 
 
 async def __process_image_batch_async(
@@ -1349,7 +1461,7 @@ async def __process_image_batch_async(
 
     try:
         response = await client.invoke_model(
-            body=orjson.dumps(body),
+            body=orjson.dumps(body),  # type: ignore
             modelId="global.cohere.embed-v4:0",
             contentType="application/json",
             accept="application/json",
@@ -1383,8 +1495,7 @@ async def __process_image_batch_async(
         else:
             # For other errors, log with full stack trace
             log.exception(
-                "Failed to process batch"
-                f" {batch_num}/{total_batches}: {str(e)}"  # noqa: E501
+                f"Failed to process batch {batch_num}/{total_batches}: {str(e)}"  # noqa: E501
             )
         raise
 
@@ -1401,39 +1512,43 @@ async def __embedding_images_async(
     total_batches = (total_images + batch_size - 1) // batch_size
 
     log.info(
-        f"Processing {total_images} images in "
+        msg=f"Processing {total_images} images in "
         f"{total_batches} batches of {batch_size}"
     )
 
     # Create aiobedrock client with assume_role_arn
-    async with aiobedrock.Client(
-        region_name=AWS_REGION,
-        assume_role_arn=__get_assume_role_arn("bedrock"),
-    ) as client:
-        # Create tasks for all batches
-        tasks = []
-        for batch_start in range(0, total_images, batch_size):
-            batch_end = min(batch_start + batch_size, total_images)
-            batch_images = images[batch_start:batch_end]
-            batch_num = (batch_start // batch_size) + 1
+    if AWS_REGION:
+        async with aiobedrock.Client(
+            region_name=AWS_REGION,
+            assume_role_arn=__get_assume_role_arn("bedrock"),  # type: ignore
+        ) as client:
+            # Create tasks for all batches
+            tasks = []
+            for batch_start in range(0, total_images, batch_size):
+                batch_end = min(batch_start + batch_size, total_images)
+                batch_images = images[batch_start:batch_end]
+                batch_num = (batch_start // batch_size) + 1
 
-            task = __process_image_batch_async(
-                client=client,
-                batch_images=batch_images,
-                batch_num=batch_num,
-                total_batches=total_batches,
-                batch_start=batch_start,
-                batch_end=batch_end,
-            )
-            tasks.append(task)
+                task = __process_image_batch_async(
+                    client=client,
+                    batch_images=batch_images,
+                    batch_num=batch_num,
+                    total_batches=total_batches,
+                    batch_start=batch_start,
+                    batch_end=batch_end,
+                )
+                tasks.append(task)
 
-        # Execute all batches concurrently
-        all_batch_results = await asyncio.gather(*tasks)
+            # Execute all batches concurrently
+            all_batch_results = await asyncio.gather(*tasks)
 
-        # Flatten all embeddings into a single list
-        all_embeddings = []
-        for batch_embeddings in all_batch_results:
-            all_embeddings.extend(batch_embeddings)
+            # Flatten all embeddings into a single list
+            all_embeddings = []
+            for batch_embeddings in all_batch_results:
+                all_embeddings.extend(batch_embeddings)
+    else:
+        log.error("Missing AWS_REGION for bedrock, exit application")
+        return {"embeddings": {EMBEDDING_OUTPUT_TYPE: []}}
 
     # Return result in the same format as the original function
     return {"embeddings": {EMBEDDING_OUTPUT_TYPE: all_embeddings}}
