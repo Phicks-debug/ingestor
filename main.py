@@ -13,8 +13,9 @@ import asyncio
 import aiobedrock
 
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+from datetime import datetime
 from logsim import CustomLogger
 from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
@@ -61,15 +62,30 @@ _ASSUME_ROLE_MAP = {
 app = FastAPI()
 log = CustomLogger()
 
+# In-memory store for tracking background task status
+task_status_store: dict[str, "SyncTaskStatus"] = {}
 
-class TaskStatus(Enum):
+
+class DocumentStatus(Enum):
     """Status of document processing task"""
 
     PENDING = "pending"
+    PROCESSING = "processing"
+    EMBEDDING = "embedding"
+    INGESTING = "ingesting"
     SUCCESS = "success"
     THROTTLED = "throttled"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+class TaskStatus(Enum):
+    """Status of a background task"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    FAILED = "failed"
+    COMPLETED = "completed"
 
 
 @dataclass
@@ -79,9 +95,28 @@ class DocumentTask:
     s3_key: str
     filename: str
     content_hash: str
-    status: TaskStatus = TaskStatus.PENDING
+    status: DocumentStatus = DocumentStatus.PENDING
     retry_count: int = 0
     error_message: Optional[str] = None
+
+
+@dataclass
+class SyncTaskStatus:
+    """Represents the status of a background sync task"""
+
+    task_id: str
+    started_at: str
+    status: TaskStatus = TaskStatus.PENDING
+    completed_at: Optional[str] = None
+    total_documents: int = 0
+    processed_documents: int = 0
+    successful_documents: int = 0
+    skipped_documents: int = 0
+    failed_documents: int = 0
+    failed_files: list[dict] = field(default_factory=list)
+    current_operation: Optional[str] = None
+    error_message: Optional[str] = None
+    documents: list[DocumentTask] = field(default_factory=list)
 
 
 @app.get("/health")
@@ -92,9 +127,102 @@ def health_check():
     )
 
 
-@app.get("/documents/status")
-def get_documents_status():
-    pass
+@app.get("/documents/sync/status")
+def get_all_sync_status():
+    """
+    Get status of all background sync tasks.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "status": (
+                        task.status.value
+                        if isinstance(task.status, TaskStatus)
+                        else task.status
+                    ),
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                    "total_documents": task.total_documents,
+                    "processed_documents": task.processed_documents,
+                    "successful_documents": task.successful_documents,
+                    "skipped_documents": task.skipped_documents,
+                    "failed_documents": task.failed_documents,
+                    "current_operation": task.current_operation,
+                }
+                for task in task_status_store.values()
+            ]
+        },
+    )
+
+
+@app.get("/documents/sync/status/{task_id}")
+def get_sync_status(task_id: str):
+    """
+    Get status of a specific background sync task.
+    """
+    if task_id not in task_status_store:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Task {task_id} not found"},
+        )
+
+    task = task_status_store[task_id]
+    return JSONResponse(
+        status_code=200,
+        content={
+            "task_id": task.task_id,
+            "status": (
+                task.status.value
+                if isinstance(task.status, TaskStatus)
+                else task.status
+            ),
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+            "total_documents": task.total_documents,
+            "processed_documents": task.processed_documents,
+            "successful_documents": task.successful_documents,
+            "skipped_documents": task.skipped_documents,
+            "failed_documents": task.failed_documents,
+            "failed_files": task.failed_files,
+            "current_operation": task.current_operation,
+            "error_message": task.error_message,
+        },
+    )
+
+
+@app.get("/documents/sync/{task_id}/documents")
+def get_sync_documents(task_id: str):
+    """
+    Get detailed list of all documents in a specific sync task.
+    Shows which documents are being processed, done, or failed.
+    """
+    if task_id not in task_status_store:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Task {task_id} not found"},
+        )
+
+    task = task_status_store[task_id]
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "task_id": task.task_id,
+            "documents": [
+                {
+                    "filename": doc.filename,
+                    "s3_key": doc.s3_key,
+                    "status": doc.status.value,
+                    "retry_count": doc.retry_count,
+                    "error_message": doc.error_message,
+                }
+                for doc in task.documents
+            ],
+        },
+    )
 
 
 @app.post("/documents/upload")
@@ -140,11 +268,28 @@ async def sync_document(background_tasks: BackgroundTasks):
     Trigger async processing of documents from S3.
     Returns immediately while processing happens in the background.
     """
-    background_tasks.add_task(sync_document_from_s3)
+    # Generate unique task ID
+    task_id = str(uuid.uuid4())
+
+    # Initialize task status
+    task_status = SyncTaskStatus(
+        task_id=task_id,
+        status=TaskStatus.RUNNING,
+        started_at=datetime.now().isoformat(),
+        current_operation="Initializing sync...",
+    )
+    task_status_store[task_id] = task_status
+
+    # Add background task with task_id
+    background_tasks.add_task(sync_document_from_s3, task_id)
 
     return JSONResponse(
         status_code=202,
-        content={"messages": "Document sync started in background"},
+        content={
+            "task_id": task_id,
+            "message": "Document sync started in background",
+            "status_url": f"/documents/sync/status/{task_id}",
+        },
     )
 
 
@@ -154,7 +299,7 @@ def delete_document(document_id: int):
     return {"status": "deleted", "document_id": document_id}
 
 
-def sync_document_from_s3():
+def sync_document_from_s3(task_id: str):
     """
     Background task to process documents from S3 with retry mechanism.
     Tracks document hashes to only process new/modified documents.
@@ -163,14 +308,22 @@ def sync_document_from_s3():
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 60
 
+    # Get task status from store
+    task_status = task_status_store.get(task_id)
+    if not task_status:
+        log.error(f"Task {task_id} not found in status store")
+        return
+
     s3_client = __create_aws_client("s3")
 
     try:
         # Load existing document hashes
+        task_status.current_operation = "Loading document hashes..."
         stored_hashes = __load_document_hashes()
         log.info(f"Loaded {len(stored_hashes)} document hashes\n")
 
         # List all documents in the S3 bucket
+        task_status.current_operation = "Listing documents in S3..."
         response = s3_client.list_objects_v2(
             Bucket=S3_DOCUMENTS_BUCKET,
             Prefix="documents/",
@@ -184,9 +337,15 @@ def sync_document_from_s3():
                     __delete_document_from_qdrant(s3_key)
                 stored_hashes.clear()
                 __save_document_hashes(stored_hashes)
+
+            # Mark task as completed
+            task_status.status = TaskStatus.COMPLETED
+            task_status.completed_at = datetime.now().isoformat()
+            task_status.current_operation = "Completed (no documents found)"
             return
 
         # Create task list for all documents
+        task_status.current_operation = "Preparing document tasks..."
         tasks: list[DocumentTask] = []
         current_s3_keys = set()
 
@@ -225,6 +384,11 @@ def sync_document_from_s3():
 
         log.info(f"** Total tasks created: {len(tasks)}\n")
 
+        # Update task status with total count and store documents
+        task_status.total_documents = len(tasks)
+        task_status.documents = tasks
+        task_status.current_operation = f"Processing {len(tasks)} documents..."
+
         # Process documents with retry logic
         updated_hashes = {}
         retry_round = 0
@@ -234,7 +398,11 @@ def sync_document_from_s3():
             pending_tasks = [
                 t
                 for t in tasks
-                if t.status in [TaskStatus.PENDING, TaskStatus.THROTTLED]
+                if t.status
+                in [
+                    DocumentStatus.PENDING,
+                    DocumentStatus.THROTTLED,
+                ]
             ]
 
             if not pending_tasks:
@@ -253,12 +421,15 @@ def sync_document_from_s3():
             log.info(f"<< Processing {len(pending_tasks)} documents...\n")
 
             for task in pending_tasks:
-                if task.status == TaskStatus.THROTTLED:
+                if task.status == DocumentStatus.THROTTLED:
                     task.retry_count += 1
                     log.info(
                         f"<< Retrying {task.filename} "
                         f"(attempt {task.retry_count}/{MAX_RETRIES})"
                     )
+
+                # Update task status with current operation
+                task_status.current_operation = f"Processing {task.filename}"
 
                 try:
                     success = __process_single_document(
@@ -269,22 +440,29 @@ def sync_document_from_s3():
 
                     if success:
                         # Document processed successfully or skipped
-                        if task.status == TaskStatus.SUCCESS:
+                        if task.status == DocumentStatus.SUCCESS:
                             updated_hashes[task.s3_key] = task.content_hash
-                        elif task.status == TaskStatus.SKIPPED:
+                            task_status.successful_documents += 1
+                        elif task.status == DocumentStatus.SKIPPED:
                             updated_hashes[task.s3_key] = task.content_hash
+                            task_status.skipped_documents += 1
+
+                        # Update processed count
+                        task_status.processed_documents += 1
 
                 except Exception as e:
                     log.exception(f"Failed to process {task.filename}: {e}")
-                    task.status = TaskStatus.FAILED
+                    task.status = DocumentStatus.FAILED
                     task.error_message = str(e)
+                    task_status.failed_documents += 1
+                    task_status.processed_documents += 1
 
             retry_round += 1
 
         # Mark remaining throttled tasks as failed after max retries
         for task in tasks:
-            if task.status == TaskStatus.THROTTLED:
-                task.status = TaskStatus.FAILED
+            if task.status == DocumentStatus.THROTTLED:
+                task.status = DocumentStatus.FAILED
                 log.error(
                     f"{task.filename} failed after {MAX_RETRIES} "
                     f"retry attempts: {task.error_message}\n"
@@ -295,20 +473,32 @@ def sync_document_from_s3():
         log.info("PROCESSING SUMMARY")
         log.info("=" * 60)
 
-        success_count = sum(1 for t in tasks if t.status == TaskStatus.SUCCESS)
-        skipped_count = sum(1 for t in tasks if t.status == TaskStatus.SKIPPED)
-        failed_count = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+        success_n = sum(1 for t in tasks if t.status == DocumentStatus.SUCCESS)
+        skipped_n = sum(1 for t in tasks if t.status == DocumentStatus.SKIPPED)
+        failed_n = sum(1 for t in tasks if t.status == DocumentStatus.FAILED)
 
-        log.info(f"✓ Successful: {success_count}")
-        log.info(f"⊘ Skipped:    {skipped_count}")
-        log.info(f"✗ Failed:     {failed_count}")
+        log.info(f"✓ Successful: {success_n}")
+        log.info(f"⊘ Skipped:    {skipped_n}")
+        log.info(f"✗ Failed:     {failed_n}")
         log.info(f"= Total:      {len(tasks)}")
 
-        if failed_count > 0:
+        task_status.successful_documents = success_n
+        task_status.skipped_documents = skipped_n
+        task_status.failed_documents = failed_n
+        task_status.processed_documents = len(tasks)
+
+        if failed_n > 0:
             log.info("FAILED DOCUMENTS:")
             for task in tasks:
-                if task.status == TaskStatus.FAILED:
+                if task.status == DocumentStatus.FAILED:
                     log.error(f"  - {task.filename}: {task.error_message}")
+                    # Add to failed files list
+                    task_status.failed_files.append(
+                        {
+                            "filename": task.filename,
+                            "error": task.error_message,
+                        }
+                    )
 
         log.info("=" * 60 + "\n")
 
@@ -322,12 +512,23 @@ def sync_document_from_s3():
                 __delete_document_from_qdrant(deleted_key)
 
         # Save updated hashes
+        task_status.current_operation = "Saving document hashes..."
         __save_document_hashes(updated_hashes)
         log.info("Document sync completed")
         log.debug(f"Processed {len(updated_hashes)} documents")
 
+        # Mark task as completed
+        task_status.status = TaskStatus.COMPLETED
+        task_status.completed_at = datetime.now().isoformat()
+        task_status.current_operation = "Completed successfully"
+
     except Exception as e:
         log.exception(f"Error in document sync: {str(e)}")
+        # Mark task as failed
+        task_status.status = TaskStatus.FAILED
+        task_status.completed_at = datetime.now().isoformat()
+        task_status.error_message = str(e)
+        task_status.current_operation = "Failed with error"
 
 
 def parsing(file_content: bytes) -> str:
@@ -855,6 +1056,9 @@ def __process_single_document(
     Raises exception for other errors.
     """
     try:
+        # Mark as processing
+        task.status = DocumentStatus.PROCESSING
+
         # Download document from S3
         file_obj = s3_client.get_object(
             Bucket=S3_DOCUMENTS_BUCKET,
@@ -868,7 +1072,7 @@ def __process_single_document(
             and stored_hashes[task.s3_key] == task.content_hash
         ):
             log.info(f"Skipping unchanged document: {task.filename}")
-            task.status = TaskStatus.SKIPPED
+            task.status = DocumentStatus.SKIPPED
             return True
 
         # Document is new or modified
@@ -915,12 +1119,14 @@ def __process_single_document(
             log.info("S3 upload completed")
 
         # Generate embeddings - this is where throttling might occur
+        task.status = DocumentStatus.EMBEDDING
         log.info(msg=f"Generating embeddings for {task.filename}")
         image_embeddings = embedding_images(images)
         log.info(msg=f"Generated embeddings for {task.filename}")
 
         # Upsert vectors in Qdrant with S3 keys
         metadata = {"filename": task.filename, "s3_key": task.s3_key}
+        task.status = DocumentStatus.INGESTING
         upsert_database(
             chunks=images,
             is_image=True,
@@ -930,14 +1136,14 @@ def __process_single_document(
         )
 
         # Mark as successful
-        task.status = TaskStatus.SUCCESS
+        task.status = DocumentStatus.SUCCESS
         log.info(f"Successfully processed {task.filename}\n")
         return True
 
     except Exception as e:
         if __is_timeout_error(e):
             # Timeout error - mark as failed immediately without retry
-            task.status = TaskStatus.FAILED
+            task.status = DocumentStatus.FAILED
             error_summary = str(e).split("\n")[0][:150]
             task.error_message = error_summary
             log.error(
@@ -947,7 +1153,7 @@ def __process_single_document(
             raise
         elif __is_throttle_error(e):
             # Throttle error - mark for retry
-            task.status = TaskStatus.THROTTLED
+            task.status = DocumentStatus.THROTTLED
             error_summary = str(e).split("\n")[0][:150]
             task.error_message = error_summary
             log.warning(
@@ -957,7 +1163,7 @@ def __process_single_document(
             return False
         else:
             # Other error - re-raise
-            task.status = TaskStatus.FAILED
+            task.status = DocumentStatus.FAILED
             task.error_message = str(e)
             raise
 
