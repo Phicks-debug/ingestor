@@ -55,6 +55,10 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE"))  # type: ignore
 EMBEDDING_OUTPUT_TYPE = os.getenv("EMBEDDING_OUTPUT_TYPE")
 EMBEDDING_OUTPUT_DIMENSION = int(os.getenv("EMBEDDING_OUTPUT_DIMENSION"))  # type: ignore # noqa: E501
 
+# Batch processing configuration
+NUMBER_OF_IMAGE_PER_INVOKE = int(os.getenv("NUMBER_OF_IMAGE_PER_INVOKE"))  # type: ignore # noqa: E501
+NUMBER_OF_CONCURRENT_INVOKE = int(os.getenv("NUMBER_OF_CONCURRENT_INVOKE"))  # type: ignore # noqa: E501
+
 _ASSUME_ROLE_MAP = {
     "s3": lambda: os.getenv("AWS_S3_ASSUME_ROLE_ARN"),
     "bedrock": lambda: os.getenv("AWS_BEDROCK_ASSUME_ROLE_ARN"),
@@ -477,13 +481,19 @@ def embedding_texts(chunks: list[str]) -> list:
     return orjson.loads(response["body"].read())
 
 
-def embedding_images(images: list[str], batch_size: int = 10) -> dict:
+def embedding_images(images: list[str]) -> dict:
     """
     Invoke Bedrock embedding model to get images embeddings.
     Processes images in batches concurrently
     using asyncio to avoid input length limits.
+    Uses NUMBER_OF_IMAGE_PER_INVOKE to determine batch size.
     """
-    return asyncio.run(__embedding_images_async(images, batch_size))
+    return asyncio.run(
+        __embedding_images_async(
+            images=images,
+            batch_size=NUMBER_OF_IMAGE_PER_INVOKE,
+        )
+    )
 
 
 def upsert_database(
@@ -1441,63 +1451,65 @@ async def __process_image_batch_async(
     total_batches: int,
     batch_start: int,
     batch_end: int,
+    semaphore: asyncio.Semaphore,
 ) -> list:
     """
-    Process a single batch of images asynchronously.
+    Process a single batch of images asynchronously with semaphore control.
     """
-    log.info(
-        f"Processing batch {batch_num}/{total_batches} "
-        f"(images {batch_start + 1}-{batch_end})"
-    )
-
-    body = {
-        "images": batch_images,
-        "input_type": "search_document",
-        "embedding_types": [EMBEDDING_OUTPUT_TYPE],
-        "output_dimension": EMBEDDING_OUTPUT_DIMENSION,
-        "max_tokens": 128000,
-        "truncate": "NONE",
-    }
-
-    try:
-        response = await client.invoke_model(
-            body=orjson.dumps(body),  # type: ignore
-            modelId="global.cohere.embed-v4:0",
-            contentType="application/json",
-            accept="application/json",
-            trace="ENABLED",
-        )
-
-        batch_result = orjson.loads(response)
-        batch_embeddings = batch_result["embeddings"][EMBEDDING_OUTPUT_TYPE]
-
+    async with semaphore:
         log.info(
-            f"Successfully processed batch {batch_num}/{total_batches} "
-            f"({len(batch_embeddings)} embeddings)"
+            f"Processing batch {batch_num}/{total_batches} "
+            f"(images {batch_start + 1}-{batch_end})"
         )
 
-        return batch_embeddings
+        body = {
+            "images": batch_images,
+            "input_type": "search_document",
+            "embedding_types": [EMBEDDING_OUTPUT_TYPE],
+            "output_dimension": EMBEDDING_OUTPUT_DIMENSION,
+            "max_tokens": 128000,
+            "truncate": "NONE",
+        }
 
-    except Exception as e:
-        # Check error type and log appropriately
-        if __is_timeout_error(e):
-            # Timeout errors - log as error without full trace
-            log.error(
-                f"Batch {batch_num}/{total_batches} timed out: "
-                f"{str(e).split(':')[0] if ':' in str(e) else str(e)[:100]}"
+        try:
+            response = await client.invoke_model(
+                body=orjson.dumps(body),  # type: ignore
+                modelId="global.cohere.embed-v4:0",
+                contentType="application/json",
+                accept="application/json",
+                trace="ENABLED",
             )
-        elif __is_throttle_error(e):
-            # Throttle errors - log as warning
-            log.warning(
-                f"Batch {batch_num}/{total_batches} throttled/disconnected: "
-                f"{str(e).split(':')[0] if ':' in str(e) else str(e)[:100]}"
+
+            batch_result = orjson.loads(response)
+            batch_embeddings = batch_result["embeddings"][EMBEDDING_OUTPUT_TYPE]  # type: ignore # noqa: E501
+
+            log.info(
+                f"Successfully processed batch {batch_num}/{total_batches} "
+                f"({len(batch_embeddings)} embeddings)"
             )
-        else:
-            # For other errors, log with full stack trace
-            log.exception(
-                f"Failed to process batch {batch_num}/{total_batches}: {str(e)}"  # noqa: E501
-            )
-        raise
+
+            return batch_embeddings
+
+        except Exception as e:
+            # Check error type and log appropriately
+            if __is_timeout_error(e):
+                # Timeout errors - log as error without full trace
+                log.error(
+                    f"Batch {batch_num}/{total_batches} timed out: "
+                    f"{str(e).split(':')[0] if ':' in str(e) else str(e)[:100]}"  # noqa: E501
+                )
+            elif __is_throttle_error(e):
+                # Throttle errors - log as warning
+                log.warning(
+                    f"Batch {batch_num}/{total_batches} throttled: "
+                    f"{str(e).split(':')[0] if ':' in str(e) else str(e)[:100]}"  # noqa: E501
+                )
+            else:
+                # For other errors, log with full stack trace
+                log.exception(
+                    f"Failed to process batch {batch_num}/{total_batches}: {str(e)}"  # noqa: E501
+                )
+            raise
 
 
 async def __embedding_images_async(
@@ -1506,14 +1518,16 @@ async def __embedding_images_async(
 ) -> dict:
     """
     Async function to invoke Bedrock embedding model for images.
-    Processes all batches concurrently using asyncio.
+    Processes batches with controlled concurrency using semaphore.
+    Only NUMBER_OF_CONCURRENT_INVOKE invokes run concurrently at a time.
     """
     total_images = len(images)
     total_batches = (total_images + batch_size - 1) // batch_size
 
     log.info(
         msg=f"Processing {total_images} images in "
-        f"{total_batches} batches of {batch_size}"
+        f"{total_batches} batches of {batch_size} "
+        f"(max {NUMBER_OF_CONCURRENT_INVOKE} concurrent invokes)"
     )
 
     # Create aiobedrock client with assume_role_arn
@@ -1522,6 +1536,9 @@ async def __embedding_images_async(
             region_name=AWS_REGION,
             assume_role_arn=__get_assume_role_arn("bedrock"),  # type: ignore
         ) as client:
+            # Create semaphore to limit concurrent batch processing
+            semaphore = asyncio.Semaphore(NUMBER_OF_CONCURRENT_INVOKE)
+
             # Create tasks for all batches
             tasks = []
             for batch_start in range(0, total_images, batch_size):
@@ -1536,16 +1553,42 @@ async def __embedding_images_async(
                     total_batches=total_batches,
                     batch_start=batch_start,
                     batch_end=batch_end,
+                    semaphore=semaphore,
                 )
                 tasks.append(task)
 
-            # Execute all batches concurrently
-            all_batch_results = await asyncio.gather(*tasks)
+            # Execute all batches with controlled concurrency
+            # The semaphore ensures only NUMBER_OF_CONCURRENT_INVOKE invokes
+            # run at the same time
+            all_batch_results = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,  # Handle error for one batch without stopping others # noqa: E501
+            )
 
-            # Flatten all embeddings into a single list
+            # Flatten all embeddings into a single list, handling exceptions
             all_embeddings = []
-            for batch_embeddings in all_batch_results:
-                all_embeddings.extend(batch_embeddings)
+            failed_batches = []
+            for idx, batch_result in enumerate(all_batch_results):
+                if isinstance(batch_result, Exception):
+                    # Store failed batch for later
+                    failed_batches.append((idx + 1, batch_result))
+                else:
+                    # Successfully processed batch, extend embeddings
+                    all_embeddings.extend(batch_result)
+
+            # If all batches failed, raise the first exception
+            if failed_batches and len(all_embeddings) == 0:
+                batch_num, exception = failed_batches[0]
+                log.error(
+                    f"All {len(failed_batches)} batches failed. "
+                    f"First failure: batch {batch_num}"
+                )
+                raise exception
+            elif failed_batches:
+                # Some batches failed but some succeeded
+                log.warning(
+                    f"{len(failed_batches)} out of {total_batches} batches failed"
+                )
     else:
         log.error("Missing AWS_REGION for bedrock, exit application")
         return {"embeddings": {EMBEDDING_OUTPUT_TYPE: []}}
