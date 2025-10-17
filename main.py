@@ -305,9 +305,6 @@ def sync_document_from_s3(task_id: str):
     Tracks document hashes to only process new/modified documents.
     Handles throttling with up to 3 retry attempts and 60-second delays.
     """
-    MAX_RETRIES = 3
-    RETRY_DELAY_SECONDS = 60
-
     # Get task status from store
     task_status = task_status_store.get(task_id)
     if not task_status:
@@ -329,60 +326,17 @@ def sync_document_from_s3(task_id: str):
             Prefix="documents/",
         )
 
+        # Handle empty S3 bucket case
         if "Contents" not in response:
-            log.info("No documents found in S3")
-            if stored_hashes:
-                log.info("Deleting all documents from Qdrant")
-                for s3_key in stored_hashes.keys():
-                    __delete_document_from_qdrant(s3_key)
-                stored_hashes.clear()
-                __save_document_hashes(stored_hashes)
-
-            # Mark task as completed
+            __handle_empty_s3_bucket(stored_hashes)
             task_status.status = TaskStatus.COMPLETED
             task_status.completed_at = datetime.now().isoformat()
             task_status.current_operation = "Completed (no documents found)"
             return
 
-        # Create task list for all documents
+        # Prepare document tasks
         task_status.current_operation = "Preparing document tasks..."
-        tasks: list[DocumentTask] = []
-        current_s3_keys = set()
-
-        log.info("=" * 60)
-        log.info("PREPARING DOCUMENT PROCESSING TASKS")
-        log.info("=" * 60)
-
-        for obj in response["Contents"]:
-            s3_key = obj["Key"]
-            filename = s3_key.split("/")[-1]
-
-            if not filename:
-                continue
-
-            current_s3_keys.add(s3_key)
-
-            # Download just to get the content hash
-            try:
-                file_obj = s3_client.get_object(
-                    Bucket=S3_DOCUMENTS_BUCKET,
-                    Key=s3_key,
-                )
-                content = file_obj["Body"].read()
-                content_hash = __calculate_content_hash(content)
-
-                task = DocumentTask(
-                    s3_key=s3_key,
-                    filename=filename,
-                    content_hash=content_hash,
-                )
-                tasks.append(task)
-                log.info(f"+ Added task for: {filename}")
-            except Exception as e:
-                log.exception(f"Failed to create task for {filename}: {e}")
-                continue
-
-        log.info(f"** Total tasks created: {len(tasks)}\n")
+        tasks, current_s3_keys = __prepare_document_tasks(s3_client, response)
 
         # Update task status with total count and store documents
         task_status.total_documents = len(tasks)
@@ -390,126 +344,15 @@ def sync_document_from_s3(task_id: str):
         task_status.current_operation = f"Processing {len(tasks)} documents..."
 
         # Process documents with retry logic
-        updated_hashes = {}
-        retry_round = 0
+        updated_hashes = __process_documents_with_retry(
+            tasks, s3_client, stored_hashes, task_status
+        )
 
-        while retry_round <= MAX_RETRIES:
-            # Get tasks that need processing
-            pending_tasks = [
-                t
-                for t in tasks
-                if t.status
-                in [
-                    DocumentStatus.PENDING,
-                    DocumentStatus.THROTTLED,
-                ]
-            ]
+        # Print processing summary
+        __print_processing_summary(tasks, task_status)
 
-            if not pending_tasks:
-                break
-
-            if retry_round > 0:
-                log.info("=" * 60)
-                log.info(f"RETRY ROUND {retry_round}/{MAX_RETRIES}")
-                log.info("=" * 60)
-                log.info(
-                    f"Waiting {RETRY_DELAY_SECONDS} seconds "
-                    "to refresh throttle limits..."
-                )
-                time.sleep(RETRY_DELAY_SECONDS)
-
-            log.info(f"<< Processing {len(pending_tasks)} documents...\n")
-
-            for task in pending_tasks:
-                if task.status == DocumentStatus.THROTTLED:
-                    task.retry_count += 1
-                    log.info(
-                        f"<< Retrying {task.filename} "
-                        f"(attempt {task.retry_count}/{MAX_RETRIES})"
-                    )
-
-                # Update task status with current operation
-                task_status.current_operation = f"Processing {task.filename}"
-
-                try:
-                    success = __process_single_document(
-                        task,
-                        s3_client,
-                        stored_hashes,
-                    )
-
-                    if success:
-                        # Document processed successfully or skipped
-                        if task.status == DocumentStatus.SUCCESS:
-                            updated_hashes[task.s3_key] = task.content_hash
-                            task_status.successful_documents += 1
-                        elif task.status == DocumentStatus.SKIPPED:
-                            updated_hashes[task.s3_key] = task.content_hash
-                            task_status.skipped_documents += 1
-
-                        # Update processed count
-                        task_status.processed_documents += 1
-
-                except Exception as e:
-                    log.exception(f"Failed to process {task.filename}: {e}")
-                    task.status = DocumentStatus.FAILED
-                    task.error_message = str(e)
-                    task_status.failed_documents += 1
-                    task_status.processed_documents += 1
-
-            retry_round += 1
-
-        # Mark remaining throttled tasks as failed after max retries
-        for task in tasks:
-            if task.status == DocumentStatus.THROTTLED:
-                task.status = DocumentStatus.FAILED
-                log.error(
-                    f"{task.filename} failed after {MAX_RETRIES} "
-                    f"retry attempts: {task.error_message}\n"
-                )
-
-        # Print summary
-        log.info("=" * 60)
-        log.info("PROCESSING SUMMARY")
-        log.info("=" * 60)
-
-        success_n = sum(1 for t in tasks if t.status == DocumentStatus.SUCCESS)
-        skipped_n = sum(1 for t in tasks if t.status == DocumentStatus.SKIPPED)
-        failed_n = sum(1 for t in tasks if t.status == DocumentStatus.FAILED)
-
-        log.info(f"✓ Successful: {success_n}")
-        log.info(f"⊘ Skipped:    {skipped_n}")
-        log.info(f"✗ Failed:     {failed_n}")
-        log.info(f"= Total:      {len(tasks)}")
-
-        task_status.successful_documents = success_n
-        task_status.skipped_documents = skipped_n
-        task_status.failed_documents = failed_n
-        task_status.processed_documents = len(tasks)
-
-        if failed_n > 0:
-            log.info("FAILED DOCUMENTS:")
-            for task in tasks:
-                if task.status == DocumentStatus.FAILED:
-                    log.error(f"  - {task.filename}: {task.error_message}")
-                    # Add to failed files list
-                    task_status.failed_files.append(
-                        {
-                            "filename": task.filename,
-                            "error": task.error_message,
-                        }
-                    )
-
-        log.info("=" * 60 + "\n")
-
-        # Detect and delete documents removed from S3
-        deleted_keys = set(stored_hashes.keys()) - current_s3_keys
-        if deleted_keys:
-            log.info(f"Detected {len(deleted_keys)} deleted documents")
-            for deleted_key in deleted_keys:
-                deleted_filename = deleted_key.split("/")[-1]
-                log.info(f"Deleting document from Qdrant: {deleted_filename}")
-                __delete_document_from_qdrant(deleted_key)
+        # Handle deleted documents
+        __handle_deleted_documents(stored_hashes, current_s3_keys)
 
         # Save updated hashes
         task_status.current_operation = "Saving document hashes..."
@@ -651,28 +494,56 @@ def upsert_database(
 ):
     """
     Upsert vectors into Qdrant vector database.
+    Raises ConnectionError if unable to connect to the database.
     """
     # Create client
-    client = QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-        https=False,
-    )
+    try:
+        client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+            https=False,
+        )
+    except Exception as e:
+        error_msg = f"Failed to create Qdrant client: {str(e)}"
+        log.error(error_msg)
+        raise ConnectionError(error_msg) from e
 
     # Ensure collection exists
     try:
         client.get_collection(collection_name=QDRANT_COLLECTION)
         log.info(f"Collection '{QDRANT_COLLECTION}' already exists")
-    except Exception:
+    except ConnectionError:
+        # Re-raise connection errors
+        raise
+    except Exception as e:
+        # Check if this is a connection error
+        if __is_connection_error(e):
+            error_msg = (
+                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                "Please ensure the vector database is running and accessible."
+            )
+            log.error(error_msg)
+            raise ConnectionError(error_msg) from e
+
         # Create collection if it doesn't exist
-        log.info(f"Creating collection '{QDRANT_COLLECTION}'")
-        client.create_collection(
-            collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(
-                size=EMBEDDING_OUTPUT_DIMENSION,
-                distance=Distance.COSINE,
-            ),
-        )
+        try:
+            log.info(f"Creating collection '{QDRANT_COLLECTION}'")
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(
+                    size=EMBEDDING_OUTPUT_DIMENSION,
+                    distance=Distance.COSINE,
+                ),
+            )
+        except Exception as create_error:
+            if __is_connection_error(create_error):
+                error_msg = (
+                    f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                    "Please ensure the vector database is running."
+                )
+                log.error(error_msg)
+                raise ConnectionError(error_msg) from create_error
+            raise
 
     embeddings = embedding_results["embeddings"][EMBEDDING_OUTPUT_TYPE]
 
@@ -706,14 +577,24 @@ def upsert_database(
 
     # Upsert points to Qdrant
     log.info(f"Upserting {len(points)} points")
-    client.upsert(
-        collection_name=QDRANT_COLLECTION,
-        points=points,
-    )
-    log.info(
-        msg=f"Successfully upserted {len(points)} "
-        f"vectors for {metadata['filename']}"
-    )
+    try:
+        client.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=points,
+        )
+        log.info(
+            msg=f"Successfully upserted {len(points)} "
+            f"vectors for {metadata['filename']}"
+        )
+    except Exception as e:
+        if __is_connection_error(e):
+            error_msg = (
+                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                "Please ensure the vector database is running and accessible."
+            )
+            log.error(error_msg)
+            raise ConnectionError(error_msg) from e
+        raise
 
 
 def __validate_parsing_response(response: str) -> str:
@@ -983,6 +864,7 @@ def __calculate_content_hash(content: bytes) -> str:
 def __delete_document_from_qdrant(s3_key: str):
     """
     Delete all vectors associated with a document from Qdrant.
+    Raises ConnectionError if unable to connect to the database.
     """
     try:
         client = QdrantClient(
@@ -1005,7 +887,15 @@ def __delete_document_from_qdrant(s3_key: str):
         )
         log.info(f"Deleted vectors for document: {s3_key}")
     except Exception as e:
+        if __is_connection_error(e):
+            error_msg = (
+                f"Cannot connect to Qdrant database at {QDRANT_URL}. "
+                "Please ensure the vector database is running and accessible."
+            )
+            log.error(error_msg)
+            raise ConnectionError(error_msg) from e
         log.exception(f"Failed to delete document from Qdrant: {e}")
+        raise
 
 
 def __is_timeout_error(exception: Exception) -> bool:
@@ -1045,6 +935,31 @@ def __is_throttle_error(exception: Exception) -> bool:
     ) and not __is_timeout_error(exception)
 
 
+def __is_connection_error(exception: Exception) -> bool:
+    """
+    Check if an exception is a database connection error.
+    """
+    error_str = str(exception).lower()
+    exception_type = type(exception).__name__.lower()
+
+    # Check for common connection error indicators
+    return (
+        "cannot assign requested address" in error_str
+        or "connection refused" in error_str
+        or "connection reset" in error_str
+        or "connection error" in error_str
+        or "connecterror" in exception_type
+        or "connectionerror" in exception_type
+        or "responsehandlingexception" in exception_type
+        or "errno 99" in error_str
+        or "errno 111" in error_str  # Connection refused
+        or "errno 104" in error_str  # Connection reset by peer
+        or "network unreachable" in error_str
+        or "host unreachable" in error_str
+        or "no route to host" in error_str
+    )
+
+
 def __process_single_document(
     task: DocumentTask,
     s3_client,
@@ -1073,6 +988,7 @@ def __process_single_document(
         ):
             log.info(f"Skipping unchanged document: {task.filename}")
             task.status = DocumentStatus.SKIPPED
+            task.error_message = None
             return True
 
         # Document is new or modified
@@ -1137,9 +1053,19 @@ def __process_single_document(
 
         # Mark as successful
         task.status = DocumentStatus.SUCCESS
+        task.error_message = None
         log.info(f"Successfully processed {task.filename}\n")
         return True
 
+    except ConnectionError as e:
+        # Database connection error - mark as failed immediately
+        task.status = DocumentStatus.FAILED
+        task.error_message = str(e)
+        log.error(
+            f"FAILED: {task.filename} - "
+            f"Database connection error: {str(e)}\n"  # noqa: E501
+        )
+        raise
     except Exception as e:
         if __is_timeout_error(e):
             # Timeout error - mark as failed immediately without retry
@@ -1165,6 +1091,234 @@ def __process_single_document(
             # Other error - re-raise
             task.status = DocumentStatus.FAILED
             task.error_message = str(e)
+            raise
+
+
+def __handle_empty_s3_bucket(stored_hashes: dict) -> None:
+    """
+    Handle the case when no documents are found in S3.
+    Deletes all documents from Qdrant if any exist.
+    """
+    log.info("No documents found in S3")
+    if stored_hashes:
+        log.info("Deleting all documents from Qdrant")
+        try:
+            for s3_key in stored_hashes.keys():
+                __delete_document_from_qdrant(s3_key)
+            stored_hashes.clear()
+            __save_document_hashes(stored_hashes)
+        except ConnectionError as e:
+            log.error(
+                f"Failed to delete documents from Qdrant: {e}. "
+                "Vector database may be unavailable."
+            )
+            # Don't clear hashes if deletion failed
+            raise
+
+
+def __prepare_document_tasks(
+    s3_client,
+    s3_response: dict,
+) -> tuple[list[DocumentTask], set[str]]:
+    """
+    Create document tasks from S3 objects.
+    Returns: (tasks, current_s3_keys)
+    """
+    tasks: list[DocumentTask] = []
+    current_s3_keys = set()
+
+    log.info("=" * 60)
+    log.info("PREPARING DOCUMENT PROCESSING TASKS")
+    log.info("=" * 60)
+
+    for obj in s3_response["Contents"]:
+        s3_key = obj["Key"]
+        filename = s3_key.split("/")[-1]
+
+        if not filename:
+            continue
+
+        current_s3_keys.add(s3_key)
+
+        # Download just to get the content hash
+        try:
+            file_obj = s3_client.get_object(
+                Bucket=S3_DOCUMENTS_BUCKET,
+                Key=s3_key,
+            )
+            content = file_obj["Body"].read()
+            content_hash = __calculate_content_hash(content)
+
+            task = DocumentTask(
+                s3_key=s3_key,
+                filename=filename,
+                content_hash=content_hash,
+            )
+            tasks.append(task)
+            log.info(f"+ Added task for: {filename}")
+        except Exception as e:
+            log.exception(f"Failed to create task for {filename}: {e}")
+            continue
+
+    log.info(f"** Total tasks created: {len(tasks)}\n")
+    return tasks, current_s3_keys
+
+
+def __process_documents_with_retry(
+    tasks: list[DocumentTask],
+    s3_client,
+    stored_hashes: dict,
+    task_status: SyncTaskStatus,
+) -> dict:
+    """
+    Process documents with retry logic for throttled requests.
+    Returns: updated_hashes dict
+    """
+    MAX_RETRIES = 3
+    RETRY_DELAY_SECONDS = 60
+    updated_hashes = {}
+    retry_round = 0
+
+    while retry_round <= MAX_RETRIES:
+        # Get tasks that need processing
+        pending_tasks = [
+            t
+            for t in tasks
+            if t.status
+            in [
+                DocumentStatus.PENDING,
+                DocumentStatus.THROTTLED,
+            ]
+        ]
+
+        if not pending_tasks:
+            break
+
+        if retry_round > 0:
+            log.info("=" * 60)
+            log.info(f"RETRY ROUND {retry_round}/{MAX_RETRIES}")
+            log.info("=" * 60)
+            log.info(
+                f"Waiting {RETRY_DELAY_SECONDS} seconds "
+                "to refresh throttle limits..."
+            )
+            time.sleep(RETRY_DELAY_SECONDS)
+
+        log.info(f"<< Processing {len(pending_tasks)} documents...\n")
+
+        for task in pending_tasks:
+            if task.status == DocumentStatus.THROTTLED:
+                task.retry_count += 1
+                log.info(
+                    f"<< Retrying {task.filename} "
+                    f"(attempt {task.retry_count}/{MAX_RETRIES})"
+                )
+
+            # Update task status with current operation
+            task_status.current_operation = f"Processing {task.filename}"
+
+            try:
+                success = __process_single_document(
+                    task,
+                    s3_client,
+                    stored_hashes,
+                )
+
+                if success:
+                    # Document processed successfully or skipped
+                    if task.status == DocumentStatus.SUCCESS:
+                        updated_hashes[task.s3_key] = task.content_hash
+                        task_status.successful_documents += 1
+                    elif task.status == DocumentStatus.SKIPPED:
+                        updated_hashes[task.s3_key] = task.content_hash
+                        task_status.skipped_documents += 1
+
+                    # Update processed count
+                    task_status.processed_documents += 1
+
+            except Exception as e:
+                log.exception(f"Failed to process {task.filename}: {e}")
+                task.status = DocumentStatus.FAILED
+                task.error_message = str(e)
+                task_status.failed_documents += 1
+                task_status.processed_documents += 1
+
+        retry_round += 1
+
+    # Mark remaining throttled tasks as failed after max retries
+    for task in tasks:
+        if task.status == DocumentStatus.THROTTLED:
+            task.status = DocumentStatus.FAILED
+            log.error(
+                f"{task.filename} failed after {MAX_RETRIES} "
+                f"retry attempts: {task.error_message}\n"
+            )
+
+    return updated_hashes
+
+
+def __print_processing_summary(
+    tasks: list[DocumentTask],
+    task_status: SyncTaskStatus,
+) -> None:
+    """
+    Print summary of document processing results.
+    """
+    log.info("=" * 60)
+    log.info("PROCESSING SUMMARY")
+    log.info("=" * 60)
+
+    success_n = sum(1 for t in tasks if t.status == DocumentStatus.SUCCESS)
+    skipped_n = sum(1 for t in tasks if t.status == DocumentStatus.SKIPPED)
+    failed_n = sum(1 for t in tasks if t.status == DocumentStatus.FAILED)
+
+    log.info(f"✓ Successful: {success_n}")
+    log.info(f"⊘ Skipped:    {skipped_n}")
+    log.info(f"✗ Failed:     {failed_n}")
+    log.info(f"= Total:      {len(tasks)}")
+
+    task_status.successful_documents = success_n
+    task_status.skipped_documents = skipped_n
+    task_status.failed_documents = failed_n
+    task_status.processed_documents = len(tasks)
+
+    if failed_n > 0:
+        log.info("FAILED DOCUMENTS:")
+        for task in tasks:
+            if task.status == DocumentStatus.FAILED:
+                log.error(f"  - {task.filename}: {task.error_message}")
+                # Add to failed files list
+                task_status.failed_files.append(
+                    {
+                        "filename": task.filename,
+                        "error": task.error_message,
+                    }
+                )
+
+    log.info("=" * 60 + "\n")
+
+
+def __handle_deleted_documents(
+    stored_hashes: dict,
+    current_s3_keys: any,
+) -> None:
+    """
+    Detect and delete documents that were removed from S3.
+    """
+    deleted_keys = set(stored_hashes.keys()) - current_s3_keys
+    if deleted_keys:
+        log.info(f"Detected {len(deleted_keys)} deleted documents")
+        try:
+            for deleted_key in deleted_keys:
+                deleted_filename = deleted_key.split("/")[-1]
+                log.info(f"Deleting document: {deleted_filename}")
+                __delete_document_from_qdrant(deleted_key)
+        except ConnectionError as e:
+            log.error(
+                f"Failed to delete documents from Qdrant: {e}. "
+                "Vector database may be unavailable."
+            )
+            # Exist vì đéo có database thì làm ăn con cặc gì nữa
             raise
 
 
