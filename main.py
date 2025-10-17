@@ -1574,7 +1574,7 @@ async def __embedding_images_async(
                     failed_batches.append((idx + 1, batch_result))
                 else:
                     # Successfully processed batch, extend embeddings
-                    all_embeddings.extend(batch_result)
+                    all_embeddings.extend(batch_result)  # type: ignore
 
             # If all batches failed, raise the first exception
             if failed_batches and len(all_embeddings) == 0:
@@ -1587,7 +1587,7 @@ async def __embedding_images_async(
             elif failed_batches:
                 # Some batches failed but some succeeded
                 log.warning(
-                    f"{len(failed_batches)} out of {total_batches} batches failed"
+                    f"{len(failed_batches)} out of {total_batches} batches failed"  # noqa: E501
                 )
     else:
         log.error("Missing AWS_REGION for bedrock, exit application")
