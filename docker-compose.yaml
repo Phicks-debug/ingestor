@@ -10,8 +10,6 @@ services:
       QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY}"
       QDRANT__SERVICE__WEB_CONSOLE_ENABLED: "true"
 
-  minio:
-
   ingestor:
     build: .
     container_name: ingestor
