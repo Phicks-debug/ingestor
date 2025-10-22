@@ -677,6 +677,64 @@ def __download_cached_images_from_s3(s3_keys: list[str]) -> list[str]:
     return base64_images
 
 
+def __delete_cached_images_from_s3(filename: str) -> None:
+    """Delete cached images for a document from S3."""
+    if not S3_IMAGES_BUCKET:
+        log.warning("S3_IMAGES_BUCKET not set. Skipping cached image deletion.")
+        return
+
+    s3_client = __create_aws_client("s3")
+    doc_name = os.path.splitext(filename)[0]
+    prefix = f"images/{doc_name}/"
+
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        page_iterator = paginator.paginate(
+            Bucket=S3_IMAGES_BUCKET,
+            Prefix=prefix,
+        )
+
+        objects_to_delete: list[dict[str, str]] = []
+        deleted_count = 0
+
+        for page in page_iterator:
+            contents = page.get("Contents", [])
+            for obj in contents:
+                key = obj.get("Key")
+                if not key or key.endswith("/"):
+                    continue
+                objects_to_delete.append({"Key": key})
+
+                if len(objects_to_delete) == 1000:
+                    s3_client.delete_objects(
+                        Bucket=S3_IMAGES_BUCKET,
+                        Delete={"Objects": objects_to_delete},
+                    )
+                    deleted_count += len(objects_to_delete)
+                    objects_to_delete = []
+
+        if objects_to_delete:
+            s3_client.delete_objects(
+                Bucket=S3_IMAGES_BUCKET,
+                Delete={"Objects": objects_to_delete},
+            )
+            deleted_count += len(objects_to_delete)
+
+        if deleted_count:
+            log.info(
+                f"Deleted {deleted_count} cached image(s) for document: {filename}"
+            )
+    except s3_client.exceptions.NoSuchBucket:
+        log.warning(
+            f"Images bucket {S3_IMAGES_BUCKET} does not exist. "
+            "Skipping cached image deletion."
+        )
+    except Exception as e:
+        log.warning(
+            f"Failed to delete cached images for {filename} from S3: {e}"
+        )
+
+
 def __upload_images_to_s3(
     image_bytes_list: list[bytes],
     s3_keys: list[str],
@@ -920,16 +978,19 @@ def __check_document_unchanged(
 
 def __handle_document_change_status(
     task: DocumentTask,
-    stored_hashes: dict,
+    previous_hash: Optional[str],
 ) -> bool:
     """
     Handle document change status (new or modified).
     Returns True if document changed, False if new.
     """
-    document_changed = task.s3_key in stored_hashes
+    document_changed = previous_hash is not None
     if document_changed:
         log.info(f"Document modified, reprocessing: {task.filename}")
-        __delete_document_from_qdrant(task.s3_key)
+        try:
+            __delete_document_from_qdrant(task.s3_key)
+        finally:
+            __delete_cached_images_from_s3(task.filename)
     else:
         log.info(f"New document detected: {task.filename}")
     return document_changed
@@ -938,14 +999,18 @@ def __handle_document_change_status(
 def __get_or_convert_images(
     task: DocumentTask,
     content: bytes,
-    document_changed: bool,
+    previous_hash: Optional[str],
 ) -> tuple[list[str], list[str]]:
     """
     Get cached images or convert PDF to images.
     Returns: (images, s3_keys)
     """
-    # Only use cached images if document hasn't changed
-    if not document_changed:
+    can_use_cached_images = (
+        previous_hash is not None and previous_hash == task.content_hash
+    )
+
+    # Only use cached images if we have a matching stored hash
+    if can_use_cached_images:
         c_exists, c_s3_keys = __check_cached_images_in_s3(task.filename)
         if c_exists:
             log.info(f"Using cached images from S3 for {task.filename}")
@@ -1028,18 +1093,20 @@ def __process_single_document(
         )
         content = file_obj["Body"].read()
 
+        previous_hash = stored_hashes.get(task.s3_key)
+
         # Check if document is unchanged and should be skipped
         if __check_document_unchanged(task, stored_hashes):
             return True
 
         # Handle document change status (new or modified)
-        document_changed = __handle_document_change_status(task, stored_hashes)
+        __handle_document_change_status(task, previous_hash)
 
         # Get cached images or convert PDF to images
         images, s3_keys = __get_or_convert_images(
             task=task,
             content=content,
-            document_changed=document_changed,
+            previous_hash=previous_hash,
         )
 
         # Generate embeddings - this is where throttling might occur
@@ -1086,8 +1153,12 @@ def __handle_empty_s3_bucket(stored_hashes: dict) -> None:
     if stored_hashes:
         log.info("Deleting all documents from Qdrant")
         try:
-            for s3_key in stored_hashes.keys():
-                __delete_document_from_qdrant(s3_key)
+            for s3_key in list(stored_hashes.keys()):
+                deleted_filename = s3_key.split("/")[-1]
+                try:
+                    __delete_document_from_qdrant(s3_key)
+                finally:
+                    __delete_cached_images_from_s3(deleted_filename)
             stored_hashes.clear()
             __save_document_hashes(stored_hashes)
         except ConnectionError as e:
@@ -1295,7 +1366,11 @@ def __handle_deleted_documents(
             for deleted_key in deleted_keys:
                 deleted_filename = deleted_key.split("/")[-1]
                 log.info(f"Deleting document: {deleted_filename}")
-                __delete_document_from_qdrant(deleted_key)
+                try:
+                    __delete_document_from_qdrant(deleted_key)
+                finally:
+                    __delete_cached_images_from_s3(deleted_filename)
+                stored_hashes.pop(deleted_key, None)
         except ConnectionError as e:
             log.error(
                 f"Failed to delete documents from Qdrant: {e}. "
@@ -1390,7 +1465,12 @@ def __create_point_struct(
     """
     Create a single PointStruct for upserting to Qdrant.
     """
-    point_id = hash(f"{metadata['filename']}_{idx}")
+    source_identifier = metadata.get("s3_key") or metadata.get("filename")
+    if not source_identifier:
+        raise ValueError("Metadata must include 's3_key' or 'filename' for point IDs")
+
+    stable_id_source = f"{source_identifier}:{idx}".encode("utf-8")
+    point_id = int.from_bytes(hashlib.sha256(stable_id_source).digest()[:8], "big")
 
     payload = {
         **metadata,
@@ -1404,7 +1484,7 @@ def __create_point_struct(
         payload["chunk_content"] = chunk
 
     return PointStruct(
-        id=abs(point_id),
+        id=point_id,
         vector=vector,
         payload=payload,
     )
