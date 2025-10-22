@@ -680,7 +680,7 @@ def __download_cached_images_from_s3(s3_keys: list[str]) -> list[str]:
 def __delete_cached_images_from_s3(filename: str) -> None:
     """Delete cached images for a document from S3."""
     if not S3_IMAGES_BUCKET:
-        log.warning("S3_IMAGES_BUCKET not set. Skipping cached image deletion.")
+        log.warning("S3_IMAGES_BUCKET not set. Skipping cached deletion.")
         return
 
     s3_client = __create_aws_client("s3")
@@ -722,7 +722,7 @@ def __delete_cached_images_from_s3(filename: str) -> None:
 
         if deleted_count:
             log.info(
-                f"Deleted {deleted_count} cached image(s) for document: {filename}"
+                msg=f"Deleted {deleted_count} cached image(s) for document: {filename}"  # noqa: E501
             )
     except s3_client.exceptions.NoSuchBucket:
         log.warning(
@@ -730,9 +730,7 @@ def __delete_cached_images_from_s3(filename: str) -> None:
             "Skipping cached image deletion."
         )
     except Exception as e:
-        log.warning(
-            f"Failed to delete cached images for {filename} from S3: {e}"
-        )
+        log.warning(f"Failed to delete cached images for {filename} from S3: {e}")  # noqa: E501
 
 
 def __upload_images_to_s3(
@@ -1467,10 +1465,10 @@ def __create_point_struct(
     """
     source_identifier = metadata.get("s3_key") or metadata.get("filename")
     if not source_identifier:
-        raise ValueError("Metadata must include 's3_key' or 'filename' for point IDs")
+        raise ValueError("Metadata must include 's3_key' or 'filename' for point IDs")  # noqa: E501
 
     stable_id_source = f"{source_identifier}:{idx}".encode("utf-8")
-    point_id = int.from_bytes(hashlib.sha256(stable_id_source).digest()[:8], "big")
+    point_id = int.from_bytes(hashlib.sha256(stable_id_source).digest()[:8], "big")  # noqa: E501
 
     payload = {
         **metadata,
