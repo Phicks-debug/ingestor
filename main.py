@@ -1468,7 +1468,9 @@ def __create_point_struct(
         raise ValueError("Metadata must include 's3_key' or 'filename' for point IDs")  # noqa: E501
 
     stable_id_source = f"{source_identifier}:{idx}".encode("utf-8")
-    point_id = int.from_bytes(hashlib.sha256(stable_id_source).digest()[:8], "big")  # noqa: E501
+    digest = hashlib.sha256(stable_id_source).digest()
+    point_id = int.from_bytes(digest[:8], "big", signed=False)
+    point_id &= (1 << 63) - 1  # keep within signed 64-bit range for Qdrant
 
     payload = {
         **metadata,
